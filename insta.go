@@ -1,21 +1,21 @@
 // Copyright © 2012-2014 Lawrence E. Bakst. All rights reserved.
 
-// This code is a simulaton model of Instagram and maybe Twitter too
-// I didn't  discuss or goggle anythibg important
-// The only thing I googled where so stats about Insta and other high volume users besides Taylor Swift
+// This code is a simulation model of Instagram and probably Twitter too
+// I didn't discuss or Goggle anything about how Instagram or Twitter are implemented
+// The only thing I Googled where some stats about Insta and other high volume users besides Taylor Swift
 
 // Insta facts
 // about 1 billion users or 1 Gusers
-// They say 500M users are active each day, but that seems high to me
+// 500M users are active each day, but that seems high to me
 // unlimited followers
 // max 7500 following
 // avg followers 150
 // 95 million posts are made every day (3 years ago data point) call it 100M posts/day
-// As of 2018, there have been over 45 billion photos shared on this platform
-// A study has discovered that 8% of all Instagram accounts are fake
-// It’s estimated that posts that include at least one hashtag gain 12.6% more engagement
-// More than 4.2 billion number of Instagram likes per day
-// Around 95 millions photos is uploaded per a single day
+// as of 2018, there have been over 45 billion photos shared on this platform
+// a study has discovered that 8% of all Instagram accounts are fake
+// it's estimated that posts that include at least one hashtag gain 12.6% more engagement
+// more than 4.2 billion number of Instagram likes per day
+// around 95 millions photos is uploaded per a single day
 // what is the latency from post to first view? can't find it
 // it appears their post notification system is kinda broken
 
@@ -27,7 +27,7 @@
 // Kim Kardashian 124 M
 // Kylie Jenner 123 M
 // Beyoncé 122 M
-// Taylor Swift M
+// Taylor Swift 120 M
 
 // Not considered
 // likes, saved
@@ -43,33 +43,55 @@
 // DB, obviously sharded
 // Image, servers
 // Workers, to resolve views
-// users are bimodal so partition users into two groups based on a load factor thresthold
+// users are bimodal so partition users into two groups based on a load factor threshold
 // user load factor is followers * posts per day * engagement
-// cache goal is to reduce load on DB and image servers
+// cache goal is to reduce load on DB, image, and worker servers
 // 2 level caching, in memory on workers and SSD on image and DB servers, eg avoid hitting DB and S3 for images
 // fields we need from DB are current timestamp of large users and their most recent posts and their associated timestamps
 // posting doesn't mean much if no users try to view, it's inherently lazy, which is a huge plus
 
 // Solution
 // I can't simulate 1GUsers on my laptop so I will reduce everything by 1000 to 1M users
-// a user calls view and we first determine which users have posted since we last viewed
+// A user calls view and we first determine which users have posted since we last viewed
+// by using timestamps.
 // it's probably a small percentage of the followers and followers are capped at 7,500
 // so then we scan the active followers and looks for the oldest timestamp, drop when we
 // reach what we have already displayed and repeat until there
 
-/*
-given n users and m workers assign n/m users to each server to simulate a load balancer
-some percentage "pu" of the users assigned to each server view insta every "ws" wakeup seconds
-*/
+// Todo
+// Still doesn't accurately simulate how a scale Insta could really work
+// Group users into segments and distribute segments to multiple workers
+// Caching of images and tweets at several levels
+
+// Given n users and m workers assign n/m users to each server to simulate a load balancer
+// Some percentage "pu" of the users assigned to each server view insta every "ws" wakeup seconds
+// Use resavour sampling
 
 package main
 
 import (
 	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	"leb.io/hashland/jenkins"
 )
+
+var s = rand.NewSource(time.Now().UTC().UnixNano())
+var r = rand.New(s)
+var wg sync.WaitGroup
+
+// rbetween returns random int [a, b]
+func rbetween(a int, b int) int {
+	return r.Intn(b-a+1) + a
+}
+
+type msg struct {
+	op    string
+	id    int
+	tweet string
+}
 
 type user struct {
 	name       string
@@ -100,10 +122,53 @@ func (u *user) post(tweet string) {
 		lastTime = t
 	}
 	p := &post{pid: postID, uid: u.uid, text: tweet, fingerprint: hash(tweet), timestamp: t, deleted: false}
-	fmt.Printf("post: pid=%d, ts=%d, text=%q\n", p.pid, p.timestamp, p.text)
+	//fmt.Printf("post: pid=%d, ts=%d, text=%q\n", p.pid, p.timestamp, p.text)
 	u.timestamp = t
 	postID++
 	u.posts = append(u.posts, p)
+}
+
+func (u *user) view() (timeline []*post) {
+	//fmt.Printf("view: uid=%d\n", uid)
+	var aposts [][]*post
+	var ids []int
+	var users = make(map[int]*user)
+
+	// find all users that have new posts and get the posts we haven't seen
+	for i, id := range u.following {
+		f := getUser(id)
+		users[id] = f
+		//fmt.Printf("view: user %q followng %q\n", u.name, f.name)
+		ts := u.timestamps[i]
+		if f.timestamp == ts {
+			fmt.Printf("no new posts from %q\n", f.name)
+			continue
+		}
+		posts := f.postsAfter(ts)
+		u.timestamps[i] = posts[len(posts)-1].timestamp // update DB
+		aposts = append(aposts, posts)
+		ids = append(ids, id)
+	}
+
+	// the posts are sorted so merge them into a chronological timeline
+	for {
+		cnt := 0
+		for i, posts := range aposts {
+			if len(posts) != 0 {
+				p := aposts[i][0]
+				timeline = append(timeline, p)
+				fmt.Printf("user %q saw that %q posted post P%d contains %q, ts=%d\n",
+					u.name, users[p.uid].name, p.pid, p.text, p.timestamp)
+				aposts[i] = aposts[i][1:]
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			break
+		}
+	}
+	fmt.Printf("\n")
+	return timeline
 }
 
 // return all the posts that happened after ts
@@ -122,6 +187,7 @@ var users []*user
 var followers []*user
 
 func getUser(uid int) *user {
+	//fmt.Printf("getUser: uid=%d, len(users)=%d\n", uid, len(users))
 	return users[uid]
 }
 
@@ -140,8 +206,7 @@ type View struct {
 }
 
 type server struct {
-	msgs    chan interface{}
-	intance int
+	instance int
 }
 
 type imageServer struct {
@@ -154,51 +219,20 @@ type workerServer struct {
 
 var ws0 workerServer
 
-func (ws *workerServer) start() {
+func (ws *workerServer) start(msgs chan msg) {
+	fmt.Printf("server %d starting\n", ws.instance)
 	for {
-		msg := <-ws.msgs
-		switch msg.(type) {
-		case *View:
-			//v := msg.(*View)
-		case *post:
-			//p := msg.(*post)
-		}
-	}
-}
-
-func view(uid int) {
-	//fmt.Printf("view: uid=%d\n", uid)
-	var aposts [][]*post
-	var users = make(map[int]*user)
-
-	user := getUser(uid)
-
-	// find all users that have new posts and get the posts we haven't seen
-	for i, id := range user.following {
-		f := getUser(id)
-		users[id] = f
-		fmt.Printf("view: user %q followng %q\n", user.name, f.name)
-		ts := user.timestamps[i]
-		if f.timestamp == ts {
-			fmt.Printf("no new posts from %q\n", f.name)
-			continue
-		}
-		aposts = append(aposts, f.postsAfter(ts))
-	}
-
-	// the posts are sorted so merge them into a chronological timeline
-	for {
-		cnt := 0
-		for i, posts := range aposts {
-			if len(posts) != 0 {
-				p := aposts[i][0]
-				fmt.Printf("%q posted post P%d contains %q, ts=%d\n", users[p.uid].name, p.pid, p.text, p.timestamp)
-				aposts[i] = aposts[i][1:]
-				cnt++
-			}
-		}
-		if cnt == 0 {
-			break
+		msg := <-msgs
+		switch msg.op {
+		case "post":
+			//fmt.Printf("post\n")
+			u := getUser(msg.id)
+			u.post(msg.tweet)
+		case "view":
+			//fmt.Printf("view: %d\n", msg.id)
+			u := getUser(msg.id)
+			u.view()
+			//fmt.Printf("view: timeline=%v\n", timeline)
 		}
 	}
 }
@@ -235,37 +269,52 @@ func makeUser(name string, nfollowers int) *user {
 	return user
 }
 
-func main() {
-	makeUsers(1000000)
-	ts := makeUser("Taylor Swift", 129000)
-	es := makeUser("Ed Sheeran", 50000)
-	ts.post("foo")
-	es.post("bar")
-	ts.post("baz")
-	es.post("quux")
-	//fmt.Printf("ts=%#v\n", ts)
-	//fmt.Printf("es=%#v\n", es)
-	//for _, f := range followers {
-	//	fmt.Printf("%q=%#v\n", f.name, f)
-	//}
-	for _, user := range users {
-		view(user.uid)
+func tweeter(ch chan msg, es, ts *user) {
+	for {
+		ch <- msg{op: "post", id: ts.uid, tweet: "foo"}
+		ch <- msg{op: "post", id: es.uid, tweet: "bar"}
+		ch <- msg{op: "post", id: ts.uid, tweet: "baz"}
+		ch <- msg{op: "post", id: es.uid, tweet: "quux"}
+		time.Sleep(2 * time.Second)
 	}
 }
 
-/*
-(*
-  S has items to sample, R will contain the result
- *)
-ReservoirSample(S[1..n], R[1..k])
-  // fill the reservoir array
-  for i = 1 to k
-      R[i] := S[i]
+func viewer(ch chan msg) {
+	idx := 0
+	for {
+		r := rbetween(0, len(users)-1)
+		u := getUser(r)
+		//fmt.Printf("viewer: %d\n", u.uid)
+		ch <- msg{op: "view", id: u.uid, tweet: ""}
+		u = getUser(idx)
+		ch <- msg{op: "view", id: u.uid, tweet: ""}
+		idx++
+		if idx > len(users)-1 {
+			idx = 0
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
 
-  // replace elements with gradually decreasing probability
-  for i = k+1 to n
-    j := random(1, i)   // important: inclusive range
-    if j <= k
-        R[j] := S[i]
+func sim() {
+	ch := make(chan msg, 100)
+	go ws0.start(ch)
+	makeUsers(10)
+	ts := makeUser("Taylor Swift", 7)
+	es := makeUser("Ed Sheeran", 5)
+	fmt.Printf("ts=%#v\n", ts)
+	fmt.Printf("es=%#v\n", es)
+	wg.Add(2)
+	go tweeter(ch, es, ts)
+	go viewer(ch)
 
-*/
+	//for _, f := range followers {
+	//	fmt.Printf("%q=%#v\n", f.name, f)
+	//}
+
+	wg.Wait()
+}
+
+func main() {
+	sim()
+}
