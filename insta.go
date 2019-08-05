@@ -1,4 +1,4 @@
-// Copyright © 2012-2014 Lawrence E. Bakst. All rights reserved.
+// Copyright © 2019 Lawrence E. Bakst. All rights reserved.
 
 // This code is a simulation model of Instagram and probably Twitter too
 // I didn't discuss or Goggle anything about how Instagram or Twitter are implemented
@@ -106,10 +106,10 @@ type msg struct {
 	tweet string
 }
 
-// operations
+// operations that users can perform
 const (
-	POST = "post"
-	VIEW = "view"
+	POST = "post" // post a tweet or picture
+	VIEW = "view" // view new posts
 )
 
 type user struct {
@@ -128,6 +128,20 @@ func (u *user) follow(f *user) {
 	f.followers = append(f.followers, u.uid)
 	u.following = append(u.following, f.uid)
 	u.timestamps = append(u.timestamps, f.timestamp)
+}
+
+// return all the posts that happened after ts
+func (u *user) postsAfter(ts int64) (posts []*post) {
+	for _, post := range u.posts {
+		if post.timestamp > ts && !post.deleted {
+			posts = append(posts, post)
+		}
+	}
+	return
+}
+
+func (u *user) sendTimelineToUser(timeline []*post) {
+	//fmt.Printf("view: timeline=%v\n", timeline)
 }
 
 type post struct {
@@ -252,20 +266,6 @@ func (db *DB) View(uid int) (timeline []*post) {
 	return timeline
 }
 
-// return all the posts that happened after ts
-func (u *user) postsAfter(ts int64) (posts []*post) {
-	for _, post := range u.posts {
-		if post.timestamp > ts && !post.deleted {
-			posts = append(posts, post)
-		}
-	}
-	return
-}
-
-func (u *user) sendTimelineToUser(timeline []*post) {
-	//fmt.Printf("view: timeline=%v\n", timeline)
-}
-
 type View struct {
 	uid int
 	rid int
@@ -304,7 +304,9 @@ func (ws *workerServer) start(msgs chan msg) {
 	}
 }
 
-// code below here is user simulator
+//
+// code below here is Insta simulator
+//
 
 func tweeter(ch chan msg, es, ts *user) {
 	for {
@@ -346,7 +348,7 @@ func sim() {
 	wg.Add(2)
 	go tweeter(ch, es, ts)
 	go viewer(ch)
-	wg.Wait()
+	wg.Wait() // currently never terminates, use ^C
 }
 
 func main() {
