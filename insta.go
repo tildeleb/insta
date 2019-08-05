@@ -19,7 +19,7 @@
 // what is the latency from post to first view? can't find it
 // it appears their post notification system is kinda broken
 
-// Top stars by number of  followers — as of January 2019.
+// Top stars by number of followers — as of January 2019.
 // Cristiano Ronaldo 150 M
 // Selena Gomez 144 M
 // Ariana Grande 142 M
@@ -52,13 +52,15 @@
 
 // Solution
 // I can't simulate 1GUsers on my laptop so I will reduce everything by 1000 to 1M users
-// A user calls view and we first determine which users have posted since we last viewed
-// by using timestamps.
-// it's probably a small percentage of the followers and followers are capped at 7,500
-// so then we scan the active followers and looks for the oldest timestamp, drop when we
-// reach what we have already displayed and repeat until there
+// A user calls view. First determine which users have posted since the last view
+// by comparing a saved timestamp of the last post viewed for each person they are following
+// to current timestamp for a post.
+// It's probably a small percentage of the users they following and following is capped at 7,500.
+// Scan the following that has posted and look for a matching timestamp and advance by one.
+// Then we do a merge of all the following to get the posts in chronological order.
 
 // Todo
+// no graph of users
 // Still doesn't accurately simulate how a scale Insta could really work
 // Group users into segments and distribute segments to multiple workers
 // Caching of images and tweets at several levels
@@ -81,17 +83,34 @@ import (
 var s = rand.NewSource(time.Now().UTC().UnixNano())
 var r = rand.New(s)
 var wg sync.WaitGroup
+var ws0 workerServer
+var h = jenkins.New364(0)
+var db DB
 
 // rbetween returns random int [a, b]
 func rbetween(a int, b int) int {
 	return r.Intn(b-a+1) + a
 }
 
+func hash(s string) (ret uint64) {
+	h.Write([]byte(s))
+	ret = h.Sum64()
+	h.Reset()
+	return
+}
+
+// msg is what is sent to worker instances
 type msg struct {
 	op    string
 	id    int
 	tweet string
 }
+
+// operations
+const (
+	POST = "post"
+	VIEW = "view"
+)
 
 type user struct {
 	name       string
@@ -111,32 +130,94 @@ func (u *user) follow(f *user) {
 	u.timestamps = append(u.timestamps, f.timestamp)
 }
 
-var lastTime int64
-var postID int
+type post struct {
+	pid         int
+	uid         int
+	text        string
+	fingerprint uint64
+	timestamp   int64 // "unix" format
+	deleted     bool
+}
 
-func (u *user) post(tweet string) {
+type DB struct {
+	uid       int
+	lastTime  int64
+	postID    int
+	users     []*user
+	followers []*user // used by sim for now
+}
+
+func (db *DB) GetUser(uid int) *user {
+	//fmt.Printf("GetUser: uid=%d, len(users)=%d\n", uid, len(users))
+	return db.users[uid]
+}
+
+func (db *DB) GetPostsAfter(uid int, timestamp int64) (posts []*post) {
+	u := db.GetUser(uid)
+	posts = u.postsAfter(timestamp)
+	return
+}
+
+func (db *DB) UpdateTimestamp(uid int, timestamp int64) {
+	u := db.GetUser(uid)
+	u.timestamp = timestamp
+}
+
+func (db *DB) NumberOfUsers() int {
+	return len(db.users)
+}
+
+// NewUser allocates and stores a new user in the DB
+func (db *DB) NewUser(name string) *user {
+	u := &user{name: name, uid: db.uid}
+	db.uid++
+	db.users = append(db.users, u)
+	return u
+}
+
+// MakeUsers makes users who are just followers (for now)
+func (db *DB) MakeUsers(n int) {
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("follower%d", i)
+		db.followers = append(db.followers, db.NewUser(name))
+	}
+}
+
+// MakeUser makes famous users who have lots of followers
+func (db *DB) MakeUser(name string, nfollowers int) *user {
+	user := db.NewUser(name)
+	for i := 0; i < nfollowers; i++ {
+		u := db.followers[i]
+		u.follow(user)
+	}
+	return user
+}
+
+func (db *DB) Post(uid int, tweet string) {
+	u := db.GetUser(uid)
 	t := time.Now().UnixNano()
-	if t == lastTime {
+	if t == db.lastTime {
 		fmt.Printf("bump\n")
 		t++
-		lastTime = t
+		db.lastTime = t
 	}
-	p := &post{pid: postID, uid: u.uid, text: tweet, fingerprint: hash(tweet), timestamp: t, deleted: false}
+	p := &post{pid: db.postID, uid: u.uid, text: tweet, fingerprint: hash(tweet), timestamp: t, deleted: false}
 	//fmt.Printf("post: pid=%d, ts=%d, text=%q\n", p.pid, p.timestamp, p.text)
 	u.timestamp = t
-	postID++
+	db.postID++
 	u.posts = append(u.posts, p)
 }
 
-func (u *user) view() (timeline []*post) {
-	//fmt.Printf("view: uid=%d\n", uid)
+// View returns all the new posts on a users timeline in chronological order
+func (db *DB) View(uid int) (timeline []*post) {
+	u := db.GetUser(uid)
 	var aposts [][]*post
 	var ids []int
 	var users = make(map[int]*user)
 
 	// find all users that have new posts and get the posts we haven't seen
 	for i, id := range u.following {
-		f := getUser(id)
+		f := db.GetUser(id)
 		users[id] = f
 		//fmt.Printf("view: user %q followng %q\n", u.name, f.name)
 		ts := u.timestamps[i]
@@ -181,23 +262,8 @@ func (u *user) postsAfter(ts int64) (posts []*post) {
 	return
 }
 
-// id is the index into users
-var uid = 0
-var users []*user
-var followers []*user
-
-func getUser(uid int) *user {
-	//fmt.Printf("getUser: uid=%d, len(users)=%d\n", uid, len(users))
-	return users[uid]
-}
-
-type post struct {
-	pid         int
-	uid         int
-	text        string
-	fingerprint uint64
-	timestamp   int64 // "unix" format
-	deleted     bool
+func (u *user) sendTimelineToUser(timeline []*post) {
+	//fmt.Printf("view: timeline=%v\n", timeline)
 }
 
 type View struct {
@@ -217,64 +283,35 @@ type workerServer struct {
 	server
 }
 
-var ws0 workerServer
+type DBServer struct {
+	server
+}
 
+// start processes posts and views from users
 func (ws *workerServer) start(msgs chan msg) {
-	fmt.Printf("server %d starting\n", ws.instance)
+	fmt.Printf("worker %d starting\n", ws.instance)
 	for {
 		msg := <-msgs
 		switch msg.op {
-		case "post":
-			//fmt.Printf("post\n")
-			u := getUser(msg.id)
-			u.post(msg.tweet)
-		case "view":
-			//fmt.Printf("view: %d\n", msg.id)
-			u := getUser(msg.id)
-			u.view()
-			//fmt.Printf("view: timeline=%v\n", timeline)
+		case POST:
+			u := db.GetUser(msg.id)
+			db.Post(u.uid, msg.tweet)
+		case VIEW:
+			u := db.GetUser(msg.id)
+			timeline := db.View(u.uid)
+			u.sendTimelineToUser(timeline)
 		}
 	}
 }
 
-func newUser(name string) *user {
-	u := &user{name: name, uid: uid}
-	uid++
-	users = append(users, u)
-	return u
-}
-
-var h = jenkins.New364(0)
-
-func hash(s string) (ret uint64) {
-	h.Write([]byte(s))
-	ret = h.Sum64()
-	h.Reset()
-	return
-}
-
-func makeUsers(n int) {
-	for i := 0; i < n; i++ {
-		name := fmt.Sprintf("follower%d", i)
-		followers = append(followers, newUser(name))
-	}
-}
-
-func makeUser(name string, nfollowers int) *user {
-	user := newUser(name)
-	for i := 0; i < nfollowers; i++ {
-		u := followers[i]
-		u.follow(user)
-	}
-	return user
-}
+// code below here is user simulator
 
 func tweeter(ch chan msg, es, ts *user) {
 	for {
-		ch <- msg{op: "post", id: ts.uid, tweet: "foo"}
-		ch <- msg{op: "post", id: es.uid, tweet: "bar"}
-		ch <- msg{op: "post", id: ts.uid, tweet: "baz"}
-		ch <- msg{op: "post", id: es.uid, tweet: "quux"}
+		ch <- msg{op: POST, id: ts.uid, tweet: "foo"}
+		ch <- msg{op: POST, id: es.uid, tweet: "bar"}
+		ch <- msg{op: POST, id: ts.uid, tweet: "baz"}
+		ch <- msg{op: POST, id: es.uid, tweet: "quux"}
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -282,36 +319,33 @@ func tweeter(ch chan msg, es, ts *user) {
 func viewer(ch chan msg) {
 	idx := 0
 	for {
-		r := rbetween(0, len(users)-1)
-		u := getUser(r)
-		//fmt.Printf("viewer: %d\n", u.uid)
-		ch <- msg{op: "view", id: u.uid, tweet: ""}
-		u = getUser(idx)
-		ch <- msg{op: "view", id: u.uid, tweet: ""}
+		r := rbetween(0, db.NumberOfUsers()-1)
+		u := db.GetUser(r)
+		ch <- msg{op: VIEW, id: u.uid, tweet: ""}
+		u = db.GetUser(idx)
+		ch <- msg{op: VIEW, id: u.uid, tweet: ""}
 		idx++
-		if idx > len(users)-1 {
+		if idx > db.NumberOfUsers()-1 {
 			idx = 0
 		}
 		time.Sleep(1 * time.Second)
 	}
 }
 
+const maxUsers = 10
+const tsFollowers = 5
+const esFollowers = 3
+
+// simulate Instagram
 func sim() {
-	ch := make(chan msg, 100)
+	ch := make(chan msg, 100) // channel to communicate to worker instance
 	go ws0.start(ch)
-	makeUsers(10)
-	ts := makeUser("Taylor Swift", 7)
-	es := makeUser("Ed Sheeran", 5)
-	fmt.Printf("ts=%#v\n", ts)
-	fmt.Printf("es=%#v\n", es)
+	db.MakeUsers(maxUsers)
+	ts := db.MakeUser("Taylor Swift", tsFollowers)
+	es := db.MakeUser("Ed Sheeran", esFollowers)
 	wg.Add(2)
 	go tweeter(ch, es, ts)
 	go viewer(ch)
-
-	//for _, f := range followers {
-	//	fmt.Printf("%q=%#v\n", f.name, f)
-	//}
-
 	wg.Wait()
 }
 
