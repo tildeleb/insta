@@ -37,29 +37,35 @@
 // ads
 // non chronological order timeline
 
-// Assume
-// The main operation is a user viewing their timeline, we assume chronological order
-// assume 3 kinds of servers
-// DB, obviously sharded
-// Image, servers
-// Workers, to resolve views
-// users are bimodal so partition users into two groups based on a load factor threshold
-// user load factor is followers * posts per day * engagement
+// Assumptions and Approach
+// The main operations are:
+// 1. a user viewing their timeline, we assume chronological order
+// 2. a user making a post(s)
+// 3 kinds of instances:
+// 1. Workers, to handle views and posts
+// 2. DB, stores data about users and posts
+// 3. Image, maps hash of picture to url and has cache of popular and recent images
+// Users are bimodal so partition users into two groups based on a load factor threshold
+// user load factor is followers * posts per day * views per day
 // cache goal is to reduce load on DB, image, and worker servers
-// 2 level caching, in memory on workers and SSD on image and DB servers, eg avoid hitting DB and S3 for images
+// 2 level caching, in memory on workers and SSD on worker, image and DB servers, eg avoid hitting DB and S3 for images
 // fields we need from DB are current timestamp of large users and their most recent posts and their associated timestamps
 // posting doesn't mean much if no users try to view, it's inherently lazy, which is a huge plus
 
 // Solution
 // I can't simulate 1GUsers on my laptop so I will reduce everything by 1000 to 1M users
 // A user calls view. First determine which users have posted since the last view
-// by comparing a saved timestamp of the last post viewed for each person they are following
-// to current timestamp for a post.
+// by comparing a saved timestamp of the last post viewed for each user they are following
+// to the timestamp for the most recent post.
 // It's probably a small percentage of the users they following and following is capped at 7,500.
 // Scan the following that has posted and look for a matching timestamp and advance by one.
-// Then we do a merge of all the following to get the posts in chronological order.
+// Since the posts are sorted chronologically we do a merge of all the following posts to get the posts
+// in chronological order.
 
 // Todo
+// no multiple worker instances
+// no image servers
+// DB not modeled as a server yet
 // no graph of users
 // Still doesn't accurately simulate how a scale Insta could really work
 // Group users into segments and distribute segments to multiple workers
@@ -67,7 +73,7 @@
 
 // Given n users and m workers assign n/m users to each server to simulate a load balancer
 // Some percentage "pu" of the users assigned to each server view insta every "ws" wakeup seconds
-// Use resavour sampling
+// Use reservoir sampling to generate segments of users?
 
 package main
 
@@ -80,6 +86,7 @@ import (
 	"leb.io/hashland/jenkins"
 )
 
+// globals
 var s = rand.NewSource(time.Now().UTC().UnixNano())
 var r = rand.New(s)
 var wg sync.WaitGroup
@@ -112,6 +119,8 @@ const (
 	VIEW = "view" // view new posts
 )
 
+// represents the database entry for a user, think of the slices as sorted columns
+// no keys yet, just linear search
 type user struct {
 	name       string
 	uid        int
@@ -305,7 +314,7 @@ func (ws *workerServer) start(msgs chan msg) {
 }
 
 //
-// code below here is Insta simulator
+// code below here is very simple Instagram simulator
 //
 
 func tweeter(ch chan msg, es, ts *user) {
@@ -342,10 +351,13 @@ const esFollowers = 3
 func sim() {
 	ch := make(chan msg, 100) // channel to communicate to worker instance
 	go ws0.start(ch)
-	db.MakeUsers(maxUsers)
+	db.MakeUsers(maxUsers) // make followers for stars
+
+	// make a few stars
 	ts := db.MakeUser("Taylor Swift", tsFollowers)
 	es := db.MakeUser("Ed Sheeran", esFollowers)
 	wg.Add(2)
+
 	go tweeter(ch, es, ts)
 	go viewer(ch)
 	wg.Wait() // currently never terminates, use ^C
